@@ -1,6 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient } = require('mongodb');
 const cron = require('node-cron');
+const http = require('http');
 require('dotenv').config();
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -16,6 +17,7 @@ const COLLECTION_NAME = 'transactions';
 const SUBSCRIBERS_COLLECTION_NAME = 'subscribers';
 const REMINDER_TIME = process.env.DAILY_REMINDER_TIME || '22:00';
 const REMINDER_TIMEZONE = process.env.REMINDER_TIMEZONE || 'Asia/Ho_Chi_Minh';
+const PORT = Number.parseInt(process.env.PORT || '10000', 10);
 const ACCOUNT_CASH = 'cash';
 const ACCOUNT_BANK = 'bank';
 const TRANSFER_BANK_TO_CASH = 'bank_to_cash';
@@ -51,6 +53,23 @@ async function connectMongo() {
   const db = mongoClient.db(DB_NAME);
   transactionsCollection = db.collection(COLLECTION_NAME);
   subscribersCollection = db.collection(SUBSCRIBERS_COLLECTION_NAME);
+}
+
+function startHealthServer() {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/healthz') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Money Buddy bot is running');
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Health server đang lắng nghe cổng ${PORT}.`);
+  });
 }
 
 // Format tiền
@@ -796,6 +815,7 @@ bot.onText(/\/thongke/, async (msg) => {
 });
 
 async function startBot() {
+  startHealthServer();
   await connectMongo();
   await setupBotCommands();
   startDailyReminderScheduler();
