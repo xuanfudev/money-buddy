@@ -402,6 +402,7 @@ Bot sẽ hỏi từng bước để nhập.
 Lệnh khác:
 - /thongke: xem thống kê tổng quát
 - /huy: hủy thao tác đang nhập
+- /reset xacnhan: xóa toàn bộ dữ liệu giao dịch
 
 Mẹo: bạn có thể bấm các nút ô vuông để thao tác nhanh, không cần gõ lệnh.`;
 }
@@ -527,6 +528,7 @@ async function setupBotCommands() {
       description: 'Bắt đầu ghi giao dịch nạp tiền',
     },
     { command: 'thongke', description: 'Xem thống kê tổng quát' },
+    { command: 'reset', description: 'Xóa toàn bộ dữ liệu giao dịch' },
     { command: 'huy', description: 'Hủy thao tác đang nhập' },
     { command: 'help', description: 'Xem hướng dẫn sử dụng bot' },
   ]);
@@ -758,6 +760,36 @@ bot.onText(/^\/(start|menu)(?:@\w+)?$/, async (msg) => {
 bot.onText(/^\/huy(?:@\w+)?$/, async (msg) => {
   clearConversation(msg.chat.id);
   await sendMainMenu(msg.chat.id, 'Đã hủy thao tác hiện tại.');
+});
+
+bot.onText(/^\/reset(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
+  try {
+    await registerSubscriber(msg.chat.id);
+    clearConversation(msg.chat.id);
+
+    const confirmation = (match?.[1] || '').trim().toLowerCase();
+    if (confirmation !== 'xacnhan') {
+      await bot.sendMessage(
+        msg.chat.id,
+        '⚠️ Lệnh này sẽ xóa toàn bộ dữ liệu giao dịch. Để xác nhận, nhập: /reset xacnhan',
+        {
+          reply_markup: getMainMenuKeyboard(),
+        },
+      );
+      return;
+    }
+
+    const result = await transactionsCollection.deleteMany({});
+    await bot.sendMessage(
+      msg.chat.id,
+      `🧹 Đã reset dữ liệu thành công. Đã xóa ${result.deletedCount} giao dịch.`,
+      {
+        reply_markup: getMainMenuKeyboard(),
+      },
+    );
+  } catch (error) {
+    await bot.sendMessage(msg.chat.id, '❌ Không thể reset dữ liệu lúc này.');
+  }
 });
 
 bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
