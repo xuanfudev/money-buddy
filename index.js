@@ -2,14 +2,13 @@ const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient } = require('mongodb');
 const cron = require('node-cron');
 const http = require('http');
+const https = require('https');
 require('dotenv').config();
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
   throw new Error('Thiếu TELEGRAM_BOT_TOKEN trong biến môi trường.');
 }
-
-const bot = new TelegramBot(token, { polling: true });
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const DB_NAME = process.env.MONGODB_DB || 'money_buddy';
@@ -18,6 +17,20 @@ const SUBSCRIBERS_COLLECTION_NAME = 'subscribers';
 const REMINDER_TIME = process.env.DAILY_REMINDER_TIME || '22:00';
 const REMINDER_TIMEZONE = process.env.REMINDER_TIMEZONE || 'Asia/Ho_Chi_Minh';
 const PORT = Number.parseInt(process.env.PORT || '10000', 10);
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || '';
+const SLEEP_START_HOUR = Number.parseInt(
+  process.env.KEEP_ALIVE_SLEEP_START || '23',
+  10,
+);
+const SLEEP_END_HOUR = Number.parseInt(
+  process.env.KEEP_ALIVE_SLEEP_END || '6',
+  10,
+);
+const USE_TELEGRAM_WEBHOOK =
+  (process.env.USE_TELEGRAM_WEBHOOK || 'true').toLowerCase() === 'true';
+const WEBHOOK_PATH =
+  process.env.TELEGRAM_WEBHOOK_PATH || `/telegram-webhook/${token}`;
+const IS_WEBHOOK_MODE = USE_TELEGRAM_WEBHOOK && Boolean(RENDER_EXTERNAL_URL);
 const ACCOUNT_CASH = 'cash';
 const ACCOUNT_BANK = 'bank';
 const TRANSFER_BANK_TO_CASH = 'bank_to_cash';
@@ -29,6 +42,8 @@ const BUTTON_NAP = '🏦 Nạp';
 const BUTTON_THONGKE = '📈 Thống kê';
 const BUTTON_HELP = '📘 Help';
 const BUTTON_HUY = '❌ Hủy';
+
+const bot = new TelegramBot(token, { polling: !IS_WEBHOOK_MODE });
 
 let mongoClient;
 let transactionsCollection;
@@ -55,9 +70,40 @@ async function connectMongo() {
   subscribersCollection = db.collection(SUBSCRIBERS_COLLECTION_NAME);
 }
 
+function normalizePath(rawPath) {
+  return rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+}
+
+async function handleWebhookRequest(req, res) {
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+
+  req.on('end', async () => {
+    try {
+      const bodyText = Buffer.concat(chunks).toString('utf8');
+      const update = bodyText ? JSON.parse(bodyText) : {};
+      await bot.processUpdate(update);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (error) {
+      console.error('Webhook update lỗi:', error.message);
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false }));
+    }
+  });
+}
+
 function startHealthServer() {
-  const server = http.createServer((req, res) => {
-    if (req.url === '/healthz') {
+  const server = http.createServer(async (req, res) => {
+    const pathname = new URL(req.url || '/', 'http://localhost').pathname;
+    const webhookPath = normalizePath(WEBHOOK_PATH);
+
+    if (req.method === 'POST' && pathname === webhookPath && IS_WEBHOOK_MODE) {
+      await handleWebhookRequest(req, res);
+      return;
+    }
+
+    if (pathname === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true }));
       return;
@@ -70,6 +116,21 @@ function startHealthServer() {
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Health server đang lắng nghe cổng ${PORT}.`);
   });
+}
+
+async function setupTelegramDeliveryMode() {
+  if (!IS_WEBHOOK_MODE) {
+    await bot.deleteWebHook({ drop_pending_updates: false });
+    console.log('Bot chạy ở chế độ polling.');
+    return;
+  }
+
+  const baseUrl = RENDER_EXTERNAL_URL.replace(/\/+$/, '');
+  const webhookPath = normalizePath(WEBHOOK_PATH);
+  const webhookUrl = `${baseUrl}${webhookPath}`;
+
+  await bot.setWebHook(webhookUrl);
+  console.log(`Bot chạy ở chế độ webhook: ${webhookUrl}`);
 }
 
 // Format tiền
@@ -387,6 +448,64 @@ function startDailyReminderScheduler() {
 
   console.log(
     `Đã bật nhắc nhở hằng ngày lúc ${REMINDER_TIME} (${REMINDER_TIMEZONE}).`,
+  );
+}
+
+function getCurrentHourInTimezone(timezone) {
+  return Number.parseInt(
+    new Date().toLocaleString('en-US', {
+      hour: 'numeric',
+      hour12: false,
+      timeZone: timezone,
+    }),
+    10,
+  );
+}
+
+function isInSleepWindow() {
+  const hour = getCurrentHourInTimezone(REMINDER_TIMEZONE);
+  if (SLEEP_START_HOUR > SLEEP_END_HOUR) {
+    // Qua nửa đêm, ví dụ 23:00 → 06:00
+    return hour >= SLEEP_START_HOUR || hour < SLEEP_END_HOUR;
+  }
+  return hour >= SLEEP_START_HOUR && hour < SLEEP_END_HOUR;
+}
+
+function startKeepAlive() {
+  if (IS_WEBHOOK_MODE) {
+    console.log('Đang dùng webhook, không bật keep-alive cron.');
+    return;
+  }
+
+  if (!RENDER_EXTERNAL_URL) {
+    console.log('RENDER_EXTERNAL_URL chưa được cấu hình. Bỏ qua keep-alive.');
+    return;
+  }
+
+  const url = `${RENDER_EXTERNAL_URL}/healthz`;
+  const client = url.startsWith('https') ? https : http;
+
+  cron.schedule(
+    '*/14 * * * *',
+    () => {
+      if (isInSleepWindow()) {
+        console.log('Đang trong giờ nghỉ, bỏ qua keep-alive ping.');
+        return;
+      }
+
+      client
+        .get(url, (res) => {
+          console.log(`Keep-alive ping: ${res.statusCode}`);
+        })
+        .on('error', (err) => {
+          console.error('Keep-alive ping lỗi:', err.message);
+        });
+    },
+    { timezone: REMINDER_TIMEZONE },
+  );
+
+  console.log(
+    `Keep-alive đã bật: ping mỗi 14 phút, nghỉ từ ${SLEEP_START_HOUR}:00 đến ${SLEEP_END_HOUR}:00 (${REMINDER_TIMEZONE}).`,
   );
 }
 
@@ -817,8 +936,10 @@ bot.onText(/\/thongke/, async (msg) => {
 async function startBot() {
   startHealthServer();
   await connectMongo();
+  await setupTelegramDeliveryMode();
   await setupBotCommands();
   startDailyReminderScheduler();
+  startKeepAlive();
   console.log('Bot đang chạy với MongoDB...');
 }
 
